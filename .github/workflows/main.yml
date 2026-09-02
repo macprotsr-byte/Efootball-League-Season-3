@@ -1,0 +1,153 @@
+name: Reddit to Telegram
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  reddit-to-telegram:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Reddit and send new posts
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL: "@PESMobileupdates"
+        run: |
+          python3 <<'PY'
+          import os
+          import urllib.request
+          import urllib.parse
+          import xml.etree.ElementTree as ET
+          import html
+
+          REDDIT_URL = "https://www.reddit.com/r/pesmobile/new/.rss"
+          STATE_FILE = ".reddit_last_post"
+
+          bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
+          channel = os.environ["TELEGRAM_CHANNEL"]
+
+          # Get Reddit RSS
+          request = urllib.request.Request(
+              REDDIT_URL,
+              headers={"User-Agent": "PESMobileTelegramBot/1.0"}
+          )
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              data = response.read()
+
+          root = ET.fromstring(data)
+
+          # Find Atom entries
+          ns = {"atom": "http://www.w3.org/2005/Atom"}
+          entries = root.findall("atom:entry", ns)
+
+          if not entries:
+              print("No Reddit posts found.")
+              raise SystemExit(0)
+
+          # Reddit RSS is newest first
+          latest = entries[0]
+
+          post_id = latest.findtext("atom:id", "", ns)
+          title = latest.findtext("atom:title", "New Reddit post", ns)
+
+          link_element = latest.find("atom:link", ns)
+          link = ""
+
+          if link_element is not None:
+              link = link_element.attrib.get("href", "")
+
+          # Read previous post ID
+          old_id = ""
+          if os.path.exists(STATE_FILE):
+              with open(STATE_FILE, "r", encoding="utf-8") as f:
+                  old_id = f.read().strip()
+
+          # No new post
+          if post_id == old_id:
+              print("No new Reddit post.")
+              raise SystemExit(0)
+
+          # Send every new post between old and latest
+          new_entries = []
+
+          for entry in entries:
+              entry_id = entry.findtext("atom:id", "", ns)
+
+              if entry_id == old_id:
+                  break
+
+              new_entries.append(entry)
+
+          # Limit to 10 posts per run
+          new_entries = new_entries[:10]
+          new_entries.reverse()
+
+          for entry in new_entries:
+              title = entry.findtext(
+                  "atom:title",
+                  "New Reddit post",
+                  ns
+              )
+
+              entry_id = entry.findtext("atom:id", "", ns)
+
+              link_element = entry.find("atom:link", ns)
+              link = ""
+
+              if link_element is not None:
+                  link = link_element.attrib.get("href", "")
+
+              message = (
+                  "🆕 <b>New post on r/pesmobile</b>\n\n"
+                  f"<b>{html.escape(title)}</b>\n\n"
+                  f"🔗 <a href=\"{html.escape(link, quote=True)}\">View on Reddit</a>"
+              )
+
+              telegram_url = (
+                  f"https://api.telegram.org/bot{bot_token}/sendMessage"
+              )
+
+              payload = urllib.parse.urlencode({
+                  "chat_id": channel,
+                  "text": message,
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": "false"
+              }).encode()
+
+              telegram_request = urllib.request.Request(
+                  telegram_url,
+                  data=payload,
+                  method="POST"
+              )
+
+              with urllib.request.urlopen(
+                  telegram_request,
+                  timeout=30
+              ) as response:
+                  result = response.read().decode()
+
+              print("Telegram response:", result)
+
+          # Save newest post ID
+          with open(STATE_FILE, "w", encoding="utf-8") as f:
+              f.write(post_id)
+
+          print("Reddit update sent successfully.")
+          PY
+
+      - name: Save last Reddit post
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .reddit_last_post
+          git diff --cached --quiet || git commit -m "Update Reddit post tracker"
+          git push
