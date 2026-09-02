@@ -16,329 +16,138 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Python packages
-        run: |
-          python3 -m pip install requests
-
-      - name: Reddit to Telegram
+      - name: Check Reddit and send new posts
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: "@PESMobileupdates"
         run: |
           python3 <<'PY'
           import os
-          import json
-          import requests
+          import urllib.request
+          import urllib.parse
+          import xml.etree.ElementTree as ET
+          import html
 
-          REDDIT_URL = "https://www.reddit.com/r/pesmobile/new.json?limit=10"
+          REDDIT_URL = "https://www.reddit.com/r/pesmobile/new/.rss"
           STATE_FILE = ".reddit_last_post"
 
-          BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-          CHANNEL = os.environ["TELEGRAM_CHANNEL"]
+          bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
+          channel = os.environ["TELEGRAM_CHANNEL"]
 
-          headers = {
-              "User-Agent": "PESMobileTelegramBot/1.0"
-          }
-
-          # Get Reddit posts
-          response = requests.get(
+          # Get Reddit RSS
+          request = urllib.request.Request(
               REDDIT_URL,
-              headers=headers,
-              timeout=30
+              headers={"User-Agent": "PESMobileTelegramBot/1.0"}
           )
 
-          response.raise_for_status()
+          with urllib.request.urlopen(request, timeout=30) as response:
+              data = response.read()
 
-          reddit = response.json()
-          posts = reddit["data"]["children"]
+          root = ET.fromstring(data)
 
-          if not posts:
+          # Find Atom entries
+          ns = {"atom": "http://www.w3.org/2005/Atom"}
+          entries = root.findall("atom:entry", ns)
+
+          if not entries:
               print("No Reddit posts found.")
               raise SystemExit(0)
 
-          # Read last processed post
-          last_id = ""
+          # Reddit RSS is newest first
+          latest = entries[0]
 
+          post_id = latest.findtext("atom:id", "", ns)
+          title = latest.findtext("atom:title", "New Reddit post", ns)
+
+          link_element = latest.find("atom:link", ns)
+          link = ""
+
+          if link_element is not None:
+              link = link_element.attrib.get("href", "")
+
+          # Read previous post ID
+          old_id = ""
           if os.path.exists(STATE_FILE):
-              with open(STATE_FILE, "r") as f:
-                  last_id = f.read().strip()
+              with open(STATE_FILE, "r", encoding="utf-8") as f:
+                  old_id = f.read().strip()
 
-          newest_id = posts[0]["data"]["id"]
-
-          # If this is the first run, send only the newest post
-          if not last_id:
-              posts_to_send = [posts[0]]
-
-          else:
-              posts_to_send = []
-
-              for post in posts:
-                  post_id = post["data"]["id"]
-
-                  if post_id == last_id:
-                      break
-
-                  posts_to_send.append(post)
-
-              posts_to_send.reverse()
-
-          # Nothing new
-          if not posts_to_send:
-              print("No new Reddit posts.")
+          # No new post
+          if post_id == old_id:
+              print("No new Reddit post.")
               raise SystemExit(0)
 
-          def telegram(method, data=None, files=None):
-              url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+          # Send every new post between old and latest
+          new_entries = []
 
-              r = requests.post(
-                  url,
-                  data=data,
-                  files=files,
-                  timeout=120
+          for entry in entries:
+              entry_id = entry.findtext("atom:id", "", ns)
+
+              if entry_id == old_id:
+                  break
+
+              new_entries.append(entry)
+
+          # Limit to 10 posts per run
+          new_entries = new_entries[:10]
+          new_entries.reverse()
+
+          for entry in new_entries:
+              title = entry.findtext(
+                  "atom:title",
+                  "New Reddit post",
+                  ns
               )
 
-              print(method, r.status_code, r.text)
+              entry_id = entry.findtext("atom:id", "", ns)
 
-              r.raise_for_status()
+              link_element = entry.find("atom:link", ns)
+              link = ""
 
-              return r.json()
+              if link_element is not None:
+                  link = link_element.attrib.get("href", "")
 
-          for item in posts_to_send:
-
-              data = item["data"]
-
-              post_id = data["id"]
-              title = data.get("title", "New r/pesmobile post")
-              permalink = "https://www.reddit.com" + data.get(
-                  "permalink", ""
+              message = (
+                  "🆕 <b>New post on r/pesmobile</b>\n\n"
+                  f"<b>{html.escape(title)}</b>\n\n"
+                  f"🔗 <a href=\"{html.escape(link, quote=True)}\">View on Reddit</a>"
               )
 
-              caption = (
-                  "🆕 <b>r/pesmobile</b>\n\n"
-                  f"<b>{title}</b>\n\n"
-                  f"🔗 <a href=\"{permalink}\">View Reddit post</a>"
+              telegram_url = (
+                  f"https://api.telegram.org/bot{bot_token}/sendMessage"
               )
 
-              media_sent = False
+              payload = urllib.parse.urlencode({
+                  "chat_id": channel,
+                  "text": message,
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": "false"
+              }).encode()
 
-              # ----------------------------------------
-              # 1. Reddit native video
-              # ----------------------------------------
-
-              secure_media = data.get("secure_media")
-
-              if secure_media:
-                  reddit_video = secure_media.get("reddit_video")
-
-                  if reddit_video:
-                      video_url = reddit_video.get("fallback_url")
-
-                      if video_url:
-
-                          print("Downloading Reddit video:")
-                          print(video_url)
-
-                          video_response = requests.get(
-                              video_url,
-                              headers=headers,
-                              timeout=120
-                          )
-
-                          video_response.raise_for_status()
-
-                          video_size = len(video_response.content)
-
-                          # Telegram video limit
-                          if video_size <= 50 * 1024 * 1024:
-
-                              files = {
-                                  "video": (
-                                      "reddit_video.mp4",
-                                      video_response.content,
-                                      "video/mp4"
-                                  )
-                              }
-
-                              telegram(
-                                  "sendVideo",
-                                  data={
-                                      "chat_id": CHANNEL,
-                                      "caption": caption,
-                                      "parse_mode": "HTML",
-                                      "supports_streaming": "true"
-                                  },
-                                  files=files
-                              )
-
-                              media_sent = True
-
-                          else:
-                              print(
-                                  "Video is larger than Telegram's "
-                                  "50 MB bot limit."
-                              )
-
-              # ----------------------------------------
-              # 2. Reddit gallery
-              # ----------------------------------------
-
-              if not media_sent and data.get("is_gallery"):
-
-                  media_metadata = data.get(
-                      "media_metadata",
-                      {}
-                  )
-
-                  gallery_images = []
-
-                  for media_id, media in media_metadata.items():
-
-                      if media.get("status") != "valid":
-                          continue
-
-                      image_data = media.get("s", {})
-
-                      image_url = image_data.get("u")
-
-                      if image_url:
-                          image_url = image_url.replace(
-                              "&amp;",
-                              "&"
-                          )
-
-                          gallery_images.append(image_url)
-
-                  for image_url in gallery_images:
-
-                      print("Downloading gallery image:")
-                      print(image_url)
-
-                      image_response = requests.get(
-                          image_url,
-                          headers=headers,
-                          timeout=60
-                      )
-
-                      image_response.raise_for_status()
-
-                      image_size = len(
-                          image_response.content
-                      )
-
-                      if image_size <= 10 * 1024 * 1024:
-
-                          files = {
-                              "photo": (
-                                  "reddit_image.jpg",
-                                  image_response.content,
-                                  "image/jpeg"
-                              )
-                          }
-
-                          telegram(
-                              "sendPhoto",
-                              data={
-                                  "chat_id": CHANNEL,
-                                  "caption": caption,
-                                  "parse_mode": "HTML"
-                              },
-                              files=files
-                          )
-
-                          # Caption only on first image
-                          caption = ""
-
-                          media_sent = True
-
-              # ----------------------------------------
-              # 3. Direct Reddit image
-              # ----------------------------------------
-
-              if not media_sent:
-
-                  image_url = data.get("url_overridden_by_dest", "")
-
-                  if (
-                      image_url.startswith(
-                          "https://i.redd.it/"
-                      )
-                      or image_url.startswith(
-                          "https://preview.redd.it/"
-                      )
-                  ):
-
-                      print("Downloading Reddit image:")
-                      print(image_url)
-
-                      image_response = requests.get(
-                          image_url,
-                          headers=headers,
-                          timeout=60
-                      )
-
-                      image_response.raise_for_status()
-
-                      image_size = len(
-                          image_response.content
-                      )
-
-                      if image_size <= 10 * 1024 * 1024:
-
-                          files = {
-                              "photo": (
-                                  "reddit_image.jpg",
-                                  image_response.content,
-                                  "image/jpeg"
-                              )
-                          }
-
-                          telegram(
-                              "sendPhoto",
-                              data={
-                                  "chat_id": CHANNEL,
-                                  "caption": caption,
-                                  "parse_mode": "HTML"
-                              },
-                              files=files
-                          )
-
-                          media_sent = True
-
-              # ----------------------------------------
-              # 4. Text/link post
-              # ----------------------------------------
-
-              if not media_sent:
-
-                  telegram(
-                      "sendMessage",
-                      data={
-                          "chat_id": CHANNEL,
-                          "text": caption,
-                          "parse_mode": "HTML",
-                          "disable_web_page_preview": "false"
-                      }
-                  )
-
-              print(
-                  f"Successfully processed Reddit post: {post_id}"
+              telegram_request = urllib.request.Request(
+                  telegram_url,
+                  data=payload,
+                  method="POST"
               )
 
-          # Save newest Reddit post
-          with open(STATE_FILE, "w") as f:
-              f.write(newest_id)
+              with urllib.request.urlopen(
+                  telegram_request,
+                  timeout=30
+              ) as response:
+                  result = response.read().decode()
 
-          print("Finished successfully.")
+              print("Telegram response:", result)
+
+          # Save newest post ID
+          with open(STATE_FILE, "w", encoding="utf-8") as f:
+              f.write(post_id)
+
+          print("Reddit update sent successfully.")
           PY
 
-      - name: Save Reddit state
+      - name: Save last Reddit post
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add .reddit_last_post
-
-          git diff --cached --quiet || \
-            git commit -m "Update Reddit post tracker"
-
+          git diff --cached --quiet || git commit -m "Update Reddit post tracker"
           git push
